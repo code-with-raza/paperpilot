@@ -70,3 +70,8 @@ next-env.d.ts
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# Additional local research data
+/chroma_data/
+/backend/test_paper_*.pdf
+/backend/database/*.pycls

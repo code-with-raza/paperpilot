@@ -2,9 +2,13 @@
 """Combine vector, keyword, and graph retrieval."""
 
 import re
-
+import json
+from groq import Groq
 from rank_bm25 import BM25Okapi
 from sentence_transformers import CrossEncoder
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from Graph_Rag.embeddings import embed_query
 from Graph_Rag.vector_store import collection, search_chunks
@@ -12,6 +16,11 @@ from Graph_Rag.graph_store import load_graph
 
 
 reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+
+
+
+QUERY_EXPANSION_MODEL = "openai/gpt-oss-120b"
+MAX_CANDIDATES = 30
 
 STOP_WORDS = {
     "who", "what", "where", "when", "why", "how",
@@ -24,18 +33,90 @@ STOP_WORDS = {
 
 def tokenize(text):
     """Convert text into searchable words."""
+
     words = re.findall(r"\b[a-z0-9]+\b", text.lower())
-    return [word for word in words if word not in STOP_WORDS]
+
+    return [
+        word for word in words
+        if word not in STOP_WORDS
+    ]
+
+def _expand_query(question):
+    """Generate alternative search queries without changing the original intent."""
+
+    prompt = f"""
+Generate exactly 2 alternative search queries for the user's question.
+
+The alternatives must:
+- Preserve the original question's meaning.
+- Use different terminology or phrasing.
+- Help retrieve relevant passages from academic papers.
+- Avoid introducing new topics or assumptions.
+
+Return only valid JSON in this format:
+{{"queries": ["alternative 1", "alternative 2"]}}
+
+Original question:
+{question}
+"""
+
+    try:
+        query_client = Groq()
+        response = query_client.chat.completions.create(
+            model=QUERY_EXPANSION_MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt,
+                }
+            ],
+            temperature=0.2,
+            max_tokens=150,
+            response_format={"type": "json_object"},
+        )
+
+        result = json.loads(
+            response.choices[0].message.content
+        )
+
+        alternatives = result.get("queries", [])
+
+        if not isinstance(alternatives, list):
+            return [question]
+
+        queries = [question]
+
+        for query in alternatives:
+            if (
+                isinstance(query, str)
+                and query.strip()
+                and query.strip().lower() not in {
+                    item.lower() for item in queries
+                }
+            ):
+                queries.append(query.strip())
+
+            if len(queries) == 3:
+                break
+
+        return queries
+
+    except Exception:
+             
+             return [question]
 
 
 def clean_section_name(section):
     """Remove Markdown formatting from section names."""
+
     section = re.sub(r"^#+\s*", "", section or "")
+
     return section.replace("*", "").strip() or "Unknown"
 
 
 def _format_chunk(chunk):
     """Include section and page metadata in reranking context."""
+
     return (
         f"Section: {chunk.get('section', 'Unknown')}\n"
         f"Pages: {chunk.get('page_start', 'Unknown')}-"
@@ -46,6 +127,7 @@ def _format_chunk(chunk):
 
 def _reciprocal_rank_fusion(rankings, constant=60):
     """Combine ranked lists without adding unmatched chunks."""
+
     scores = {}
 
     for ranking in rankings:
@@ -56,6 +138,7 @@ def _reciprocal_rank_fusion(rankings, constant=60):
                 continue
 
             seen.add(chunk_id)
+
             scores[chunk_id] = scores.get(chunk_id, 0.0) + (
                 1.0 / (constant + rank)
             )
@@ -69,6 +152,8 @@ def retrieve_information(question, user_id, paper_id, top_k=5):
     if (
         not isinstance(question, str)
         or not question.strip()
+        or not user_id
+        or not paper_id
         or not isinstance(top_k, int)
         or isinstance(top_k, bool)
         or top_k < 1
@@ -97,7 +182,14 @@ def retrieve_information(question, user_id, paper_id, top_k=5):
     ):
         metadata = metadata or {}
 
-        if not document or not document.strip():
+        # Verify ownership even though Chroma already applies the filter.
+        if (
+            metadata.get("user_id") != user_id
+            or metadata.get("paper_id") != paper_id
+        ):
+            continue
+
+        if not isinstance(document, str) or not document.strip():
             continue
 
         chunks_by_id[chunk_id] = {
@@ -109,61 +201,72 @@ def retrieve_information(question, user_id, paper_id, top_k=5):
             "page_end": metadata.get("page_end", "Unknown"),
         }
 
-    if not chunks_by_id:
-        return {"chunks": [], "relationships": []}
+    # 2. Generate alternative search queries.
+    search_queries = _expand_query(question)
 
-    # 2. Retrieve keyword candidates using BM25.
+    # Prepare BM25 once for all queries.
     chunk_ids = list(chunks_by_id)
+
     tokenized_documents = [
         tokenize(f"{chunk['section']} {chunk['text']}")
         for chunk in chunks_by_id.values()
     ]
-    query_words = tokenize(question)
-    bm25_ranking = []
 
-    if query_words and any(tokenized_documents):
+    bm25 = None
+
+    if tokenized_documents and any(tokenized_documents):
         bm25 = BM25Okapi(tokenized_documents)
-        bm25_scores = bm25.get_scores(query_words)
 
-        bm25_order = sorted(
-            range(len(bm25_scores)),
-            key=lambda index: bm25_scores[index],
-            reverse=True,
+    # 3. Retrieve candidates using every search query.
+    candidate_limit = min(
+        max(top_k * 5, 1),
+        MAX_CANDIDATES,
+    )
+
+    rankings = []
+
+    for search_query in search_queries:
+
+        # Keyword retrieval.
+        query_words = tokenize(search_query)
+
+        if bm25 is not None and query_words:
+            bm25_scores = bm25.get_scores(query_words)
+
+            bm25_order = sorted(
+                range(len(bm25_scores)),
+                key=lambda index: bm25_scores[index],
+                reverse=True,
+            )
+
+            bm25_ranking = [
+                chunk_ids[index]
+                for index in bm25_order
+                if bm25_scores[index] > 0
+            ]
+
+            rankings.append(bm25_ranking)
+
+        # Semantic retrieval.
+        vector_results = search_chunks(
+            embed_query(search_query),
+            user_id,
+            paper_id,
+            top_k=candidate_limit,
         )
 
-        bm25_ranking = [
-            chunk_ids[index]
-            for index in bm25_order
-            if bm25_scores[index] > 0
+        vector_ids = (vector_results.get("ids") or [[]])[0]
+
+        vector_ranking = [
+            chunk_id
+            for chunk_id in vector_ids
+            if chunk_id in chunks_by_id
         ]
 
-    # 3. Retrieve semantic candidates from the vector database.
-    candidate_limit = min(
-        max(top_k * 5, 20),
-        len(chunks_by_id),
-    )
+        rankings.append(vector_ranking)
 
-    vector_results = search_chunks(
-        embed_query(question),
-        user_id,
-        paper_id,
-        top_k=candidate_limit,
-    )
-
-    vector_ids = (vector_results.get("ids") or [[]])[0]
-    vector_ranking = [
-        chunk_id
-        for chunk_id in vector_ids
-        if chunk_id in chunks_by_id
-    ]
-
-    # 4. Fuse actual keyword and vector rankings.
-    fused_scores = _reciprocal_rank_fusion(
-        [bm25_ranking, vector_ranking]
-    )
-
-    if not fused_scores:
-        return {"chunks": [], "relationships": []}
+    # 4. Merge and deduplicate candidates using RRF.
+    fused_scores = _reciprocal_rank_fusion(rankings)
 
     ranked_ids = sorted(
         fused_scores,
@@ -171,59 +274,107 @@ def retrieve_information(question, user_id, paper_id, top_k=5):
         reverse=True,
     )
 
-    # Rerank a broad but bounded pool of actual retrieval candidates.
     candidate_chunks = [
         chunks_by_id[chunk_id]
         for chunk_id in ranked_ids[:candidate_limit]
     ]
 
-    # 5. Rerank using question, section, page range, and content.
-    pairs = [
-        (question, _format_chunk(chunk))
-        for chunk in candidate_chunks
-    ]
+    # 5. Rerank candidates against every search query.
+    chunks = []
 
-    reranker_scores = reranker.predict(pairs)
+    if candidate_chunks:
 
-    for chunk, score in zip(candidate_chunks, reranker_scores):
-        chunk["reranker_score"] = float(score)
+        chunk_scores = {
+            chunk["chunk_id"]: []
+            for chunk in candidate_chunks
+        }
 
-    chunks = sorted(
-        candidate_chunks,
-        key=lambda chunk: chunk["reranker_score"],
-        reverse=True,
-    )[:top_k]
+        for search_query in search_queries:
 
+            pairs = [
+                (search_query, _format_chunk(chunk))
+                for chunk in candidate_chunks
+            ]
+
+            scores = reranker.predict(pairs)
+
+            for chunk, score in zip(candidate_chunks, scores):
+                chunk_scores[chunk["chunk_id"]].append(
+                    float(score)
+                )
+
+        # Keep the strongest relevance score for each chunk.
+        for chunk in candidate_chunks:
+            chunk["reranker_score"] = max(
+                chunk_scores[chunk["chunk_id"]]
+            )
+
+        chunks = sorted(
+            candidate_chunks,
+            key=lambda chunk: chunk["reranker_score"],
+            reverse=True,
+        )[:top_k]
+    
     # 6. Load graph relationships for the selected paper.
-    graph = load_graph(paper_id)
+    graph = load_graph(user_id, paper_id)
+
     unique_relationships = []
     seen_relationships = set()
 
     if graph is not None:
         for source, target, data in graph.edges(data=True):
-            item = {
-                "source": source,
-                "relation": data.get("relation", "related to"),
-                "target": target,
-                "section": data.get("section", "Unknown"),
-                "page_start": data.get("page_start", "Unknown"),
-                "page_end": data.get("page_end", "Unknown"),
-            }
 
-            key = (
-                item["source"],
-                item["relation"],
-                item["target"],
-                item["section"],
-                item["page_start"],
-                item["page_end"],
-            )
+            try:
+                evidence_records = json.loads(
+                    data.get("evidence_records", "[]")
+                )
+            except (json.JSONDecodeError, TypeError):
+                evidence_records = []
 
-            if key not in seen_relationships:
-                seen_relationships.add(key)
-                unique_relationships.append(item)
+            # Support older graph edges without evidence_records.
+            if not evidence_records:
+                evidence_records = [{
+                    "relation": data.get("relation", "related to"),
+                    "evidence": data.get("evidence", ""),
+                    "section": data.get("section", "Unknown"),
+                    "page_start": data.get("page_start", "Unknown"),
+                    "page_end": data.get("page_end", "Unknown"),
+                }]
+
+            for record in evidence_records:
+                if not isinstance(record, dict):
+                    continue
+
+                item = {
+                    "source": source,
+                    "relation": record.get(
+                        "relation",
+                        data.get("relation", "related to"),
+                    ),
+                    "target": target,
+                    "evidence": record.get("evidence", ""),
+                    "section": record.get("section", "Unknown"),
+                    "page_start": record.get("page_start", "Unknown"),
+                    "page_end": record.get("page_end", "Unknown"),
+                }
+
+                key = (
+                    item["source"],
+                    item["relation"],
+                    item["target"],
+                    item["evidence"],
+                    item["section"],
+                    item["page_start"],
+                    item["page_end"],
+                )
+
+                if key not in seen_relationships:
+                    seen_relationships.add(key)
+                    unique_relationships.append(item)
 
     # 7. Rank relationships against the question.
+    relationships = []
+
     if unique_relationships:
         relationship_pairs = [
             (
@@ -231,6 +382,7 @@ def retrieve_information(question, user_id, paper_id, top_k=5):
                 (
                     f"Relationship: {item['source']} "
                     f"{item['relation']} {item['target']}\n"
+                    f"Evidence: {item['evidence']}\n"
                     f"Section: {item['section']}\n"
                     f"Pages: {item['page_start']}-"
                     f"{item['page_end']}"
@@ -239,18 +391,19 @@ def retrieve_information(question, user_id, paper_id, top_k=5):
             for item in unique_relationships
         ]
 
-        relationship_scores = reranker.predict(relationship_pairs)
+        scores = reranker.predict(relationship_pairs)
 
-        relationships = [
-            item
-            for score, item in sorted(
-                zip(relationship_scores, unique_relationships),
-                key=lambda pair: float(pair[0]),
-                reverse=True,
-            )[:top_k]
-        ]
-    else:
-        relationships = []
+        ranked_relationships = sorted(
+            zip(scores, unique_relationships),
+            key=lambda pair: float(pair[0]),
+            reverse=True,
+        )
+
+        for score, item in ranked_relationships[:top_k]:
+            relationships.append({
+                **item,
+                "relevance_score": float(score),
+            })
 
     # 8. Normalize section names for citations.
     for chunk in chunks:
