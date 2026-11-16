@@ -6,7 +6,7 @@ from pathlib import Path
 import networkx as nx
 
 
-GRAPH_DIR = Path(__file__).resolve().parent.parent / "graph_data"
+GRAPH_DIR = Path(os.environ.get("PAPERPILOT_DATA_DIR", Path(__file__).resolve().parent.parent)) / "graph_data"
 
 
 def _get_user_graph_dir(user_id):

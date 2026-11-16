@@ -1,0 +1,11 @@
+.env
+.env.*
+__pycache__
+*.pyc
+*.db*
+*.pdf
+chroma
+chroma_data
+graph_data
+uploaded_papers
+CORRECT_EXISTING_DIRECTORY
