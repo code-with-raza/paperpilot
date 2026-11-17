@@ -8,6 +8,16 @@ import time
 from urllib.request import urlopen
 
 
+def memory_diagnostics():
+    """Read Linux container counters without changing application behavior."""
+    for name in ("memory.max", "memory.current", "memory.peak", "memory.events"):
+        try:
+            value = (Path("/sys/fs/cgroup") / name).read_text().strip()
+            print(f"[deploy] {name}: {value}", flush=True)
+        except OSError:
+            pass
+
+
 def main():
     processes = []
     stopping = False
@@ -20,6 +30,7 @@ def main():
     signal.signal(signal.SIGINT, stop)
     data = Path(os.environ.get("PAPERPILOT_DATA_DIR", "/data"))
     data.mkdir(parents=True, exist_ok=True)
+    memory_diagnostics()
     try:
         processes.append(subprocess.Popen([
             "chroma", "run", "--host", "127.0.0.1", "--port", "8001",
@@ -41,8 +52,14 @@ def main():
         ]))
         processes.append(subprocess.Popen([sys.executable, "worker.py"]))
         while not stopping:
-            if any(p.poll() is not None for p in processes):
-                raise RuntimeError("A required service exited; restarting container")
+            for name, process in zip(("chroma", "api", "worker"), processes):
+                code = process.poll()
+                if code is not None:
+                    memory_diagnostics()
+                    raise RuntimeError(
+                        f"Required service {name} exited with code {code}; "
+                        "negative codes indicate termination by a signal"
+                    )
             time.sleep(1)
     finally:
         for p in processes:
