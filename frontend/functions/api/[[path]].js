@@ -1,4 +1,4 @@
-const BACKEND = 'https://paperpilot-production-55f1173d.up.railway.app'
+const BACKEND = 'https://refactored-spoon-qvx657x6qv4rc9x4g-8000.app.github.dev'
 
 // Keep auth cookies on the Pages origin and stream uploads/PDFs unchanged.
 export async function onRequest({ request }) {
