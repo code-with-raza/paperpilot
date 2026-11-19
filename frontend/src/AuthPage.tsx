@@ -11,21 +11,27 @@ import {
 } from 'lucide-react'
 import { EMAIL_VERIFICATION_MESSAGE, submitAuth, validateAuthFields } from './auth'
 import type { AuthErrors, AuthFields, AuthMode, User } from './auth'
+import { ApiError } from './api'
 
 export default function AuthPage({
   mode,
   onAuthenticated,
   notice,
+  initialEmail = '',
+  onContinueToLogin,
 }: {
   mode: AuthMode
   onAuthenticated: (user: User) => void
   notice?: string
+  initialEmail?: string
+  onContinueToLogin?: (email: string) => void
 }) {
   const isRegister = mode === 'register'
-  const [fields, setFields] = useState<AuthFields>({ email: '', password: '', confirmPassword: '' })
+  const [fields, setFields] = useState<AuthFields>({ email: initialEmail, password: '', confirmPassword: '' })
   const [errors, setErrors] = useState<AuthErrors>({})
   const [submitError, setSubmitError] = useState('')
   const [verificationPending, setVerificationPending] = useState(false)
+  const [accountExists, setAccountExists] = useState(false)
   const [showPassword, setShowPassword] = useState(false)
   const [loading, setLoading] = useState(false)
   const submitting = useRef(false)
@@ -51,6 +57,7 @@ export default function AuthPage({
       ...(name === 'password' ? { confirmPassword: undefined } : {}),
     }))
     setSubmitError('')
+    setAccountExists(false)
   }
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
@@ -60,6 +67,7 @@ export default function AuthPage({
     const fieldErrors = validateAuthFields(mode, fields)
     setErrors(fieldErrors)
     setSubmitError('')
+    setAccountExists(false)
     const firstInvalidField = Object.keys(fieldErrors)[0]
     if (firstInvalidField) {
       document.getElementById(`auth-${firstInvalidField}`)?.focus()
@@ -79,7 +87,10 @@ export default function AuthPage({
         onAuthenticated(result.user)
       }
     } catch (error) {
-      if (mounted.current) setSubmitError((error as Error).message)
+      if (mounted.current) {
+        setSubmitError((error as Error).message)
+        setAccountExists(isRegister && error instanceof ApiError && error.status === 409)
+      }
     } finally {
       submitting.current = false
       if (mounted.current) setLoading(false)
@@ -148,12 +159,30 @@ export default function AuthPage({
             </p>
           </div>
 
+          {verificationPending && (
+            <div className="auth-field-help">
+              <p>Check the inbox for <strong>{fields.email.trim()}</strong>, including Spam or Junk.</p>
+              <p>Open the confirmation link in your email, then return here and log in with the password you chose.</p>
+              <p>No email yet? Wait a few minutes before trying again. You do not need to create another account.</p>
+            </div>
+          )}
+
           {!verificationPending && (
             <form noValidate onSubmit={handleSubmit} aria-busy={loading}>
               {submitError && (
                 <div role="alert" className="auth-error">
                   <Info size={16} />
-                  <span>{submitError}</span>
+                  <span>
+                    {submitError}
+                    {accountExists && (
+                      <>
+                        <br />
+                        <a href="#/login" onClick={() => onContinueToLogin?.(fields.email.trim())}>
+                          Log in to your existing account
+                        </a>
+                      </>
+                    )}
+                  </span>
                 </div>
               )}
 
@@ -275,7 +304,9 @@ export default function AuthPage({
               : isRegister
                 ? 'Already have an account?'
                 : 'New to PaperPilot?'}{' '}
-            <a href={isRegister ? '#/login' : '#/register'}>
+            <a href={isRegister ? '#/login' : '#/register'} onClick={() => {
+              if (isRegister) onContinueToLogin?.(fields.email.trim())
+            }}>
               {isRegister ? 'Log in' : 'Create an account'}
             </a>
           </p>

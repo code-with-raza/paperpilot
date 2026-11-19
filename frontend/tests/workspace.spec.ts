@@ -302,6 +302,36 @@ test('registration checks password requirements and duplicate accounts before op
   expect(state.requests).toContain('GET /papers/')
 })
 
+test('duplicate signup offers login with email preserved and passwords cleared', async ({ page }) => {
+  const state = await backend(page, false)
+  state.registerStatus = 409
+  await page.goto('/#/register')
+  await page.getByLabel('Email address').fill(user.email)
+  await page.getByLabel('Password', { exact: true }).fill('test-passphrase')
+  await page.getByLabel('Confirm password').fill('test-passphrase')
+  await page.getByRole('button', { name: 'Register', exact: true }).click()
+  await page.getByRole('link', { name: 'Log in to your existing account' }).click()
+  await expect(page.getByRole('heading', { name: 'Welcome back.' })).toBeVisible()
+  await expect(page.getByLabel('Email address')).toHaveValue(user.email)
+  await expect(page.getByLabel('Password', { exact: true })).toHaveValue('')
+  expect(state.requests).not.toContain('POST /auth/login')
+})
+
+test('registration server failure does not pretend an account exists or was verified', async ({ page }) => {
+  await backend(page, false)
+  await page.route('**/api/auth/register', route => route.fulfill({
+    status: 500, json: { detail: 'Registration temporarily unavailable.' },
+  }))
+  await page.goto('/#/register')
+  await page.getByLabel('Email address').fill(user.email)
+  await page.getByLabel('Password', { exact: true }).fill('test-passphrase')
+  await page.getByLabel('Confirm password').fill('test-passphrase')
+  await page.getByRole('button', { name: 'Register', exact: true }).click()
+  await expect(page.getByRole('alert')).toContainText('Registration temporarily unavailable.')
+  await expect(page.getByRole('link', { name: 'Log in to your existing account' })).toHaveCount(0)
+  await expect(page.getByRole('heading', { name: 'Check your email.' })).toHaveCount(0)
+})
+
 test('a successful login response alone does not bypass cookie verification', async ({ page }) => {
   await backend(page, false)
   await page.route('**/api/auth/login', (route) => route.fulfill({ json: user }))

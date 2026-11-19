@@ -13,6 +13,7 @@ function currentAuthPage(): AuthMode {
 
 function Root() {
   const [authPage, setAuthPage] = React.useState(currentAuthPage)
+  const [authEmail, setAuthEmail] = React.useState('')
   const [user, setUser] = React.useState<User | null>(null)
   const [checking, setChecking] = React.useState(true)
   const [error, setError] = React.useState('')
@@ -94,7 +95,8 @@ function Root() {
 
   if (!user)
     return (
-      <AuthPage key={authPage} mode={authPage} onAuthenticated={authenticated} notice={notice} />
+      <AuthPage key={authPage} mode={authPage} onAuthenticated={authenticated} notice={notice}
+        initialEmail={authEmail} onContinueToLogin={setAuthEmail} />
     )
   return (
     <>
